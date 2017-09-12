@@ -61,6 +61,9 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
 
@@ -220,6 +223,31 @@ public class P2Mojo extends AbstractMojo implements Contextualizable {
      * Folder which the feature jar files bundled by the ArtifactBundler will be copied to
      */
     private File featuresDestinationFolder;
+    
+    /**
+     * Include project dependencies in P2 repository
+     */
+    @Parameter ( defaultValue = "false" )
+    private boolean includeDependencies;
+
+    /**
+     * Include other reactor projects in P2 repository
+     */
+    @Parameter ( defaultValue = "false" )
+    private boolean includeReactor;
+    
+    /**
+     * Project types to include
+     */
+    @Parameter
+    private Set<String> includeTypes;
+    
+    
+    /**
+     * Dependency scopes to include
+     */
+    @Parameter
+    private Set<String> includeScopes;
 
     /**
      * Processing entry point.
@@ -231,6 +259,8 @@ public class P2Mojo extends AbstractMojo implements Contextualizable {
             initializeEnvironment();
             initializeRepositorySystem();
             processArtifacts(this.artifacts);
+            processDependencies(this.project);
+            processReactor();
             processFeatures();
             processEclipseArtifacts();
             executeP2PublisherPlugin();
@@ -251,6 +281,10 @@ public class P2Mojo extends AbstractMojo implements Contextualizable {
         artifacts = artifacts != null ? artifacts : new ArrayList<P2Artifact>();
         features = features != null ? features : new ArrayList<P2Artifact>();
         p2 = p2 != null ? p2 : new ArrayList<EclipseArtifact>();
+        includeTypes = includeTypes != null ? includeTypes : 
+            Collections.unmodifiableSet(new HashSet<String>(java.util.Arrays.asList("jar","bundle")));
+        includeScopes = includeScopes != null ? includeScopes : 
+            Collections.unmodifiableSet(new HashSet<String>(java.util.Arrays.asList("compile","runtime","system")));
     }
 
     private void initializeRepositorySystem() {
@@ -351,6 +385,96 @@ public class P2Mojo extends AbstractMojo implements Contextualizable {
         }
     }
 
+    private Multimap<P2Artifact, ArtifactBundlerInstructions> processDependencies ( MavenProject proj ) {
+        if ( !this.includeDependencies ) {
+            return ArrayListMultimap.create();
+        }
+
+        List<P2Artifact> dependencyArtifacts = new LinkedList<P2Artifact>();
+        Multimap<P2Artifact, ResolvedArtifact> resolvedArtifacts = ArrayListMultimap.create();
+
+        for ( org.apache.maven.artifact.Artifact dep : proj.getArtifacts() ) {
+            if ( shouldInclude(dep) ) {
+                P2Artifact p2artifact = mapP2Artifact(dep);
+                dependencyArtifacts.add(p2artifact);
+                ResolvedArtifact resolved = new ResolvedArtifact(mapArtifact(dep), null, false);
+                log.debug("Dependency " + dep.toString() + " -> " + dep.getFile());
+                resolvedArtifacts.put(p2artifact, resolved);
+            }
+        }
+
+        Multimap<P2Artifact, ArtifactBundlerInstructions> bundlerInstructions = ArrayListMultimap.create();
+        Set<Artifact> processedArtifacts = processRootArtifacts(resolvedArtifacts, bundlerInstructions, dependencyArtifacts);
+        processTransitiveArtifacts(resolvedArtifacts, processedArtifacts, bundlerInstructions, dependencyArtifacts);
+        return bundlerInstructions;
+    }
+
+
+    private Multimap<P2Artifact, ArtifactBundlerInstructions> processReactor () {
+        Multimap<P2Artifact, ArtifactBundlerInstructions> bundlerInstructions = ArrayListMultimap.create();
+        
+        if ( ! this.includeReactor )  {
+            return bundlerInstructions;
+        }
+        
+        for ( MavenProject proj : this.session.getAllProjects() ) {
+            if ( proj.equals(this.project) ) {
+                continue;
+            }
+            log.debug("Project " + proj.getId());
+
+            List<P2Artifact> attached = new LinkedList<P2Artifact>();
+            Multimap<P2Artifact, ResolvedArtifact> resolved = ArrayListMultimap.create();
+
+            if ( shouldInclude(proj.getArtifact()) ) {
+                log.debug("+ Primary Artifact " + proj.getId() + " -> " + proj.getArtifact().getFile());
+                Artifact primary = mapArtifact(proj.getArtifact());
+                P2Artifact primaryP2 = mapP2Artifact(proj.getArtifact());
+                attached.add(primaryP2);
+                resolved.put(primaryP2, new ResolvedArtifact(primary, null, true));
+            }
+
+            for ( org.apache.maven.artifact.Artifact extra : proj.getAttachedArtifacts() ) {
+                if ( shouldInclude(extra) ) {
+                    log.debug("+ Artifact " + extra + " -> " + extra.getFile());
+                    P2Artifact extraP2 = mapP2Artifact(extra);
+                    attached.add(extraP2);
+                    resolved.put(extraP2, new ResolvedArtifact(mapArtifact(extra), null, true));
+                }
+            }
+
+            Set<Artifact> processedArtifacts = processRootArtifacts(resolved, bundlerInstructions, attached);
+            processTransitiveArtifacts(resolved, processedArtifacts, bundlerInstructions, attached);
+            bundlerInstructions.putAll(processDependencies(proj));
+        }
+
+        return bundlerInstructions;
+    }
+
+
+    private boolean shouldInclude ( org.apache.maven.artifact.Artifact artifact ) {
+        return this.includeTypes.contains(artifact.getType()) && this.includeScopes.contains(artifact.getScope()); 
+    }
+
+
+    private static P2Artifact mapP2Artifact ( org.apache.maven.artifact.Artifact dep ) {
+        P2Artifact p2artifact = new P2Artifact();
+        p2artifact.setId(dep.getGroupId() + ':' + dep.getArtifactId() + ':' + dep.getVersion());
+        return p2artifact;
+    }
+
+
+    private static Artifact mapArtifact ( org.apache.maven.artifact.Artifact dep ) {
+        return new Artifact(
+            dep.getGroupId(),
+            dep.getArtifactId(),
+            dep.getBaseVersion(),
+            dep.getType(),
+            dep.getClassifier() != null ? dep.getClassifier() : "",
+            dep.isSnapshot(),
+            dep.getVersion(),
+            dep.getFile());
+    }
 
     private Multimap<P2Artifact, ResolvedArtifact> resolveArtifacts(List<P2Artifact> artifacts) {
         Multimap<P2Artifact, ResolvedArtifact> resolvedArtifacts = ArrayListMultimap.create();
